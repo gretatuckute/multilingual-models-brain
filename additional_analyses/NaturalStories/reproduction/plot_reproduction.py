@@ -27,6 +27,52 @@ MODEL_INFO = {
         "comparison_label": "GPT-2 XL (causal)",
         "color": "#009E73",
     },
+    "AuriStream100M_40Pred_BigAudioDataset_500k": {
+        "display": "AuriStream 100M–40Pred",
+        "comparison_label": "AuriStream 100M–40Pred (causal)",
+        "color": "#98352f",
+    },
+    "AuriStream100M_1Pred_BigAudioDataset_500k": {
+        "display": "AuriStream 100M–1Pred",
+        "comparison_label": "AuriStream 100M–1Pred (causal)",
+        "color": "#ea9a42",
+    },
+    "AuriStream100M_40Pred_BigAudioDataset_500k-randinit": {
+        "display": "AuriStream 100M untrained",
+        "comparison_label": "AuriStream 100M (random init)",
+        "color": "#bdbdbd",
+    },
+    "AuriStream7BDeep_40Pred_BigAudioDataset_500k": {
+        "display": "AuriStream 7B–40Pred",
+        "comparison_label": "AuriStream 7B–40Pred (20.48 s max context)",
+        "color": "#0072B2",
+    },
+    "AuriStream7BDeep_1Pred_BigAudioDataset_500k": {
+        "display": "AuriStream 7B–1Pred",
+        "comparison_label": "AuriStream 7B–1Pred (causal)",
+        "color": "#80CBC4",
+    },
+    "AuriStream7BDeep_40Pred_BigAudioDataset_500k-randinit": {
+        "display": "AuriStream 7B untrained",
+        "comparison_label": "AuriStream 7B (random init)",
+        "color": "#6F6F6F",
+        "linestyle": "--",
+    },
+    "AuriStream7BDeep_40Pred_BigAudioDataset_500k_context5s": {
+        "display": "AuriStream 7B–40Pred, 5 s context",
+        "comparison_label": "AuriStream 7B–40Pred (5 s context)",
+        "color": "#009E73",
+    },
+    "AuriStream7BDeep_40Pred_BigAudioDataset_500k_context10s": {
+        "display": "AuriStream 7B–40Pred, 10 s context",
+        "comparison_label": "AuriStream 7B–40Pred (10 s context)",
+        "color": "#E69F00",
+    },
+    "WavCochCausalV8192-vocoder": {
+        "display": "WavCoch bottleneck",
+        "comparison_label": "WavCoch bottleneck only",
+        "color": "#616161",
+    },
 }
 
 
@@ -76,7 +122,10 @@ def load_summary(run_dir: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing completed run summary under {run_dir / 'results'}")
     frame = pd.read_csv(path).sort_values("layer").reset_index(drop=True)
-    frame["normalized_layer"] = frame["layer"] / frame["layer"].max()
+    maximum_layer = int(frame["layer"].max())
+    frame["normalized_layer"] = (
+        frame["layer"] / maximum_layer if maximum_layer else 0.0
+    )
     if {"reference_std", "reference_count"}.issubset(frame.columns):
         frame["reference_sem"] = frame["reference_std"] / np.sqrt(
             frame["reference_count"]
@@ -406,12 +455,22 @@ def plot_reproduced_model_comparison(
         x = frame["normalized_layer"].to_numpy()
         mean = frame["reproduced_mean"].to_numpy()
         sem = frame["reproduced_sem"].to_numpy()
+        if len(frame) == 1:
+            ax.axhline(
+                mean[0],
+                color=info["color"],
+                linewidth=2.2,
+                linestyle=":",
+                label=info["comparison_label"],
+            )
+            continue
         ax.fill_between(x, mean - sem, mean + sem, color=info["color"], alpha=0.12)
         ax.plot(
             x,
             mean,
             color=info["color"],
-            linewidth=2.5,
+            linewidth=1.8,
+            linestyle=info.get("linestyle", "-"),
             label=info["comparison_label"],
         )
     ax.set_xlabel("Normalized layer position")
@@ -423,13 +482,29 @@ def plot_reproduced_model_comparison(
         frameon=False,
         loc="upper center",
         bbox_to_anchor=(0.5, -0.17),
-        ncol=3,
+        ncol=2 if len(model_keys) > 3 else len(model_keys),
         fontsize=10.5,
         columnspacing=1.4,
         handlelength=2.2,
     )
     fig.subplots_adjust(bottom=0.24)
-    save_figure(fig, runs_root / "figures", "normalized_layer_model_comparison")
+    context_comparison = {
+        "AuriStream7BDeep_40Pred_BigAudioDataset_500k_context5s",
+        "AuriStream7BDeep_40Pred_BigAudioDataset_500k_context10s",
+        "AuriStream7BDeep_40Pred_BigAudioDataset_500k",
+        "AuriStream7BDeep_40Pred_BigAudioDataset_500k-randinit",
+    }
+    if context_comparison.issubset(model_keys):
+        stem = "normalized_layer_auristream_7b_context_and_randinit_comparison"
+    elif "WavCochCausalV8192-vocoder" in model_keys and any(
+        key.startswith("AuriStream7B") for key in model_keys
+    ):
+        stem = "normalized_layer_auristream_7b_controls_comparison"
+    elif len(model_keys) > 2 and all(key.startswith("AuriStream") for key in model_keys):
+        stem = "normalized_layer_auristream_100m7b_comparison"
+    else:
+        stem = "normalized_layer_model_comparison"
+    save_figure(fig, runs_root / "figures", stem)
 
 
 def main() -> None:

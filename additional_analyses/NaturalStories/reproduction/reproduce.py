@@ -50,6 +50,7 @@ class ModelSpec:
     extraction: str
     reference: str
     context_words: int | None = None
+    extraction_batch_size: int = 16
 
 
 MODEL_SPECS = {
@@ -77,6 +78,26 @@ MODEL_SPECS = {
         extraction="trailing_word_context_causal",
         reference="none",
         context_words=100,
+    ),
+    "gpt_j_6b": ModelSpec(
+        key="gpt_j_6b",
+        label="gpt_j_6b",
+        display_name="GPT-J 6B",
+        model_id="EleutherAI/gpt-j-6b",
+        extraction="trailing_causal_context",
+        reference="none",
+        context_words=100,
+        extraction_batch_size=8,
+    ),
+    "qwen3_8b": ModelSpec(
+        key="qwen3_8b",
+        label="qwen3_8b",
+        display_name="Qwen3 8B",
+        model_id="Qwen/Qwen3-8B",
+        extraction="trailing_causal_context",
+        reference="none",
+        context_words=100,
+        extraction_batch_size=8,
     ),
 }
 
@@ -134,10 +155,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extract-only", action="store_true")
     parser.add_argument("--fit-only", action="store_true")
     parser.add_argument("--overwrite-embeddings", action="store_true")
+    parser.add_argument(
+        "--causal-context-mode",
+        choices=("100words", "20.48seconds"),
+        default="100words",
+        help=(
+            "Context for GPT-2/GPT-J/Qwen extraction. The time-matched mode "
+            "uses the transcript beginning 20.48 seconds before the end of "
+            "each two-second target bin."
+        ),
+    )
+    parser.add_argument(
+        "--causal-context-seconds",
+        type=float,
+        default=20.48,
+        help="Trailing duration used by --causal-context-mode 20.48seconds.",
+    )
     parser.add_argument("--reference-tolerance", type=float, default=1e-5)
     args = parser.parse_args()
     if args.extract_only and args.fit_only:
         parser.error("--extract-only and --fit-only are mutually exclusive")
+    if args.causal_context_seconds <= 2.0:
+        parser.error("--causal-context-seconds must exceed the two-second target bin")
     if args.output_dir is None:
         args.output_dir = here / "runs" / f"{args.model_key}_{SHIFT_LABEL}"
     return args
@@ -356,7 +395,7 @@ def extract_mt5_story(
 
 
 @torch.inference_mode()
-def extract_gpt2_story(
+def extract_causal_story(
     story: str,
     data_dir: Path,
     output_dir: Path,
@@ -365,31 +404,76 @@ def extract_gpt2_story(
     model,
     device: torch.device,
     overwrite: bool,
+    context_mode: str,
+    context_seconds: float,
 ) -> dict:
-    """Extract each word from a causal trailing-context GPT-2 forward pass."""
+    """Extract each target word from a causal trailing-context forward pass."""
     destination = embedding_path(output_dir, spec, story)
     if destination.exists() and not overwrite:
         print(f"[extract] story={story}: using {destination}", flush=True)
-        return load_pickle(destination)
+        cached = load_pickle(destination)
+        expected_seconds = context_seconds if context_mode == "20.48seconds" else None
+        if (
+            cached.get("causal_context_mode") != context_mode
+            or cached.get("context_seconds") != expected_seconds
+        ):
+            raise ValueError(
+                f"Existing cache {destination} has context "
+                f"{cached.get('causal_context_mode')!r}/"
+                f"{cached.get('context_seconds')!r}, expected "
+                f"{context_mode!r}/{expected_seconds!r}"
+            )
+        return cached
 
-    _, words = transcript_words(data_dir, story)
+    transcript, words = transcript_words(data_dir, story)
+    word_ends = transcript["end"].to_numpy(dtype=float)
     context_words = int(spec.context_words or 100)
-    number_of_levels = int(model.config.n_layer) + 1
+    hidden_layers = getattr(
+        model.config,
+        "num_hidden_layers",
+        getattr(model.config, "n_layer", None),
+    )
+    if hidden_layers is None:
+        raise ValueError(f"Cannot determine hidden-layer count for {spec.model_id}")
+    number_of_levels = int(hidden_layers) + 1
+    two_second_grid = np.arange(0, word_ends[-1] + 2, 2)
     vectors: Dict[int, List[np.ndarray]] = {level: [] for level in range(number_of_levels)}
     print(
         f"[extract] model={spec.key} story={story} words={len(words)} "
-        f"trailing_context_words={context_words} causal_attention=True",
+        f"context_mode={context_mode} context_words={context_words} "
+        f"context_seconds={context_seconds:g} causal_attention=True",
         flush=True,
     )
 
-    batch_size = 16
+    batch_size = int(spec.extraction_batch_size)
+    observed_context_word_counts: List[int] = []
+    observed_context_seconds: List[float] = []
     for batch_start in range(0, len(words), batch_size):
         word_indices = range(batch_start, min(batch_start + batch_size, len(words)))
         chunk_texts = []
         final_word_starts = []
         for word_index in word_indices:
-            start = max(0, word_index - context_words + 1)
+            if context_mode == "100words":
+                start = max(0, word_index - context_words + 1)
+                nominal_context_start = float(transcript.iloc[start]["start"])
+            elif context_mode == "20.48seconds":
+                candidates = np.where(word_ends[word_index] > two_second_grid)[0]
+                if candidates.size == 0:
+                    raise ValueError(
+                        f"Story {story}, word {word_index}: no two-second target bin"
+                    )
+                target_bin = int(candidates[-1])
+                target_bin_end = 2.0 * (target_bin + 1)
+                nominal_context_start = max(0.0, target_bin_end - context_seconds)
+                start = int(np.searchsorted(word_ends, nominal_context_start, side="right"))
+                start = min(start, word_index)
+            else:  # pragma: no cover - guarded by argparse
+                raise ValueError(f"Unsupported causal context mode: {context_mode}")
             chunk_words = words[start : word_index + 1]
+            observed_context_word_counts.append(len(chunk_words))
+            observed_context_seconds.append(
+                float(word_ends[word_index] - nominal_context_start)
+            )
             chunk_texts.append(" ".join(chunk_words))
             final_word_start = len(" ".join(chunk_words[:-1]))
             if len(chunk_words) > 1:
@@ -414,17 +498,27 @@ def extract_gpt2_story(
             )
             if not bool(target_mask.any()):
                 raise ValueError(
-                    f"Story {story}, word {word_index}: no GPT-2 token overlaps target "
+                    f"Story {story}, word {word_index}: no model token overlaps target "
                     f"word {words[word_index]!r}"
                 )
             target_masks.append(target_mask)
-        if encoded["input_ids"].shape[1] > int(model.config.n_positions):
+        maximum_positions = getattr(
+            model.config,
+            "max_position_embeddings",
+            getattr(model.config, "n_positions", None),
+        )
+        if maximum_positions is not None and encoded["input_ids"].shape[1] > int(maximum_positions):
             raise ValueError(
-                f"GPT-2 context has {encoded['input_ids'].shape[1]} tokens, exceeding "
-                f"the model limit of {model.config.n_positions}"
+                f"Context has {encoded['input_ids'].shape[1]} tokens, exceeding "
+                f"the model limit of {maximum_positions}"
             )
         inputs = {key: value.to(device) for key, value in encoded.items()}
-        outputs = model(**inputs, output_hidden_states=True, return_dict=True)
+        outputs = model(
+            **inputs,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
         for level, state in enumerate(outputs.hidden_states):
             for row_index, target_mask in enumerate(target_masks):
                 vector = state[row_index, target_mask.to(device), :].mean(dim=0)
@@ -450,6 +544,32 @@ def extract_gpt2_story(
         None,
         by_layer,
     )
+    payload.update(
+        {
+            "extraction": "trailing_causal_context",
+            "causal_context_mode": context_mode,
+            "context_words": context_words if context_mode == "100words" else None,
+            "context_seconds": context_seconds if context_mode == "20.48seconds" else None,
+            "target_bin_seconds": 2.0,
+            "context_window_anchor": (
+                "target_word"
+                if context_mode == "100words"
+                else "end_of_two_second_target_bin"
+            ),
+            "context_boundary_rule": (
+                None
+                if context_mode == "100words"
+                else "include complete words whose end time is after the nominal context start"
+            ),
+            "observed_context_word_count_min": int(min(observed_context_word_counts)),
+            "observed_context_word_count_median": float(np.median(observed_context_word_counts)),
+            "observed_context_word_count_max": int(max(observed_context_word_counts)),
+            "observed_context_seconds_min": float(min(observed_context_seconds)),
+            "observed_context_seconds_median": float(np.median(observed_context_seconds)),
+            "observed_context_seconds_max": float(max(observed_context_seconds)),
+            "extraction_batch_size": batch_size,
+        }
+    )
     save_pickle(payload, destination)
     print(f"[extract] story={story}: saved {destination}", flush=True)
     return payload
@@ -462,7 +582,7 @@ def load_model(spec: ModelSpec, model_id: str, revision: str, device: torch.devi
     elif spec.key == "mt5_large":
         tokenizer = T5Tokenizer.from_pretrained(model_id, revision=revision)
         model = MT5EncoderModel.from_pretrained(model_id, revision=revision)
-    elif spec.key == "gpt2_xl":
+    elif spec.key in {"gpt2_xl", "gpt_j_6b", "qwen3_8b"}:
         tokenizer = AutoTokenizer.from_pretrained(
             model_id, revision=revision, use_fast=True
         )
@@ -484,6 +604,8 @@ def extract_story(
     model,
     device: torch.device,
     overwrite: bool,
+    causal_context_mode: str,
+    causal_context_seconds: float,
 ) -> dict:
     if spec.key == "xglm_small":
         return extract_xglm_story(
@@ -493,9 +615,18 @@ def extract_story(
         return extract_mt5_story(
             story, data_dir, output_dir, spec, tokenizer, model, device, overwrite
         )
-    if spec.key == "gpt2_xl":
-        return extract_gpt2_story(
-            story, data_dir, output_dir, spec, tokenizer, model, device, overwrite
+    if spec.key in {"gpt2_xl", "gpt_j_6b", "qwen3_8b"}:
+        return extract_causal_story(
+            story,
+            data_dir,
+            output_dir,
+            spec,
+            tokenizer,
+            model,
+            device,
+            overwrite,
+            causal_context_mode,
+            causal_context_seconds,
         )
     raise ValueError(f"Unsupported model {spec.key}")
 
@@ -538,6 +669,53 @@ def result_stem(spec: ModelSpec) -> str:
     return f"cross_story_{SHIFT_LABEL}_{spec.label}_reproduced"
 
 
+def fit_binned_layer(
+    binned: Mapping[str, np.ndarray],
+    response: Mapping[str, np.ndarray],
+    layer: int,
+    model_key: str,
+    held_out_stories: Sequence[str],
+) -> tuple[List[dict], pd.DataFrame]:
+    """Fit one already-binned layer with the validated Natural Stories CV."""
+    rows: List[dict] = []
+    layer_rows = []
+    for held_out in held_out_stories:
+        training_stories = [story for story in STORIES if story != held_out]
+        x_train = np.concatenate([binned[story] for story in training_stories])
+        y_train = np.concatenate([response[STORY_NAMES[story]] for story in training_stories])
+        x_test = binned[held_out]
+        y_test = np.asarray(response[STORY_NAMES[held_out]])
+
+        x_scaler = StandardScaler()
+        y_scaler = StandardScaler()
+        x_train = x_scaler.fit_transform(x_train)
+        x_test = x_scaler.transform(x_test)
+        y_train = y_scaler.fit_transform(y_train.reshape(-1, 1)).ravel()
+        y_test = y_scaler.transform(y_test.reshape(-1, 1)).ravel()
+
+        regressor = RidgeCV(alphas=RIDGE_ALPHAS)
+        regressor.fit(x_train, y_train)
+        prediction = regressor.predict(x_test)
+        correlation = float(pearsonr(y_test, prediction).statistic)
+        row = {
+            "layer": layer,
+            "lang": held_out,
+            "story": STORY_NAMES[held_out],
+            "r": correlation,
+            "alpha": float(regressor.alpha_),
+            "n_train": int(x_train.shape[0]),
+            "n_test": int(x_test.shape[0]),
+        }
+        rows.append(row)
+        layer_rows.append([held_out, correlation])
+        print(
+            f"[fit] model={model_key} layer={layer} held_out={held_out} "
+            f"r={correlation:.9f} alpha={regressor.alpha_:g}",
+            flush=True,
+        )
+    return rows, pd.DataFrame(layer_rows, columns=["lang", "r"])
+
+
 def fit_reproduction(
     data_dir: Path,
     output_dir: Path,
@@ -576,42 +754,14 @@ def fit_reproduction(
             )
             for story in STORIES
         }
-        layer_rows = []
-        for held_out in held_out_stories:
-            training_stories = [story for story in STORIES if story != held_out]
-            x_train = np.concatenate([binned[story] for story in training_stories])
-            y_train = np.concatenate([response[STORY_NAMES[story]] for story in training_stories])
-            x_test = binned[held_out]
-            y_test = np.asarray(response[STORY_NAMES[held_out]])
-
-            x_scaler = StandardScaler()
-            y_scaler = StandardScaler()
-            x_train = x_scaler.fit_transform(x_train)
-            x_test = x_scaler.transform(x_test)
-            y_train = y_scaler.fit_transform(y_train.reshape(-1, 1)).ravel()
-            y_test = y_scaler.transform(y_test.reshape(-1, 1)).ravel()
-
-            regressor = RidgeCV(alphas=RIDGE_ALPHAS)
-            regressor.fit(x_train, y_train)
-            prediction = regressor.predict(x_test)
-            correlation = float(pearsonr(y_test, prediction).statistic)
-            row = {
-                "layer": layer,
-                "lang": held_out,
-                "story": STORY_NAMES[held_out],
-                "r": correlation,
-                "alpha": float(regressor.alpha_),
-                "n_train": int(x_train.shape[0]),
-                "n_test": int(x_test.shape[0]),
-            }
-            rows.append(row)
-            layer_rows.append([held_out, correlation])
-            print(
-                f"[fit] model={spec.key} layer={layer} held_out={held_out} "
-                f"r={correlation:.9f} alpha={regressor.alpha_:g}",
-                flush=True,
-            )
-        layerwise[layer] = pd.DataFrame(layer_rows, columns=["lang", "r"])
+        layer_rows, layerwise[layer] = fit_binned_layer(
+            binned=binned,
+            response=response,
+            layer=layer,
+            model_key=spec.key,
+            held_out_stories=held_out_stories,
+        )
+        rows.extend(layer_rows)
 
     result_dir = output_dir / "results"
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -871,6 +1021,8 @@ def main() -> None:
                 model,
                 device,
                 args.overwrite_embeddings,
+                args.causal_context_mode,
+                args.causal_context_seconds,
             )
         del model
         if torch.cuda.is_available():
@@ -886,6 +1038,12 @@ def main() -> None:
         "model_commit_hash": model_commit_hash,
         "extraction": spec.extraction,
         "context_words": spec.context_words,
+        "causal_context_mode": args.causal_context_mode,
+        "causal_context_seconds": (
+            args.causal_context_seconds
+            if args.causal_context_mode == "20.48seconds"
+            else None
+        ),
         "shift": SHIFT,
         "stories": list(args.stories),
         "canonical_encoding_stories": list(STORIES),
