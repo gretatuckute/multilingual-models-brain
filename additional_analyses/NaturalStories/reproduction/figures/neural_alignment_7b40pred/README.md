@@ -17,9 +17,17 @@ The exact plotted values are in
 Baseline 200 fits from the AuriStream-alpha repository and the completed
 Natural Stories run summaries from this repository.
 
-`figure6_exploration_neural_alignment_text_models.{pdf,png}` adds GPT-2 XL,
-GPT-J 6B, and Qwen3 8B. Baseline 200 uses canonical last-token text
-representations; Natural Stories uses the 20.48-second text context matched to
-AuriStream's maximum input duration. Its plotted values and descriptive peaks
-are stored beside the figure. Regenerate it with
-`../../plot_auristream_text_model_neural_alignment.py`.
+The two text-model comparison figures add GPT-2 XL, GPT-J 6B, and Qwen3 8B:
+
+- `figure6_neural_alignment_baseline200-last-token_naturalstories-standard`
+  uses last-token text representations for Baseline 200.
+- `figure6_neural_alignment_baseline200-mean-token_naturalstories-standard`
+  uses mean-token text representations for Baseline 200.
+
+Only the Baseline 200 text pooling differs. In both figures, Natural Stories
+uses the same 20.48-second text context matched to AuriStream's maximum input
+duration. AuriStream itself uses its mean-token representation in Baseline
+200. Exact plotted values and descriptive peaks are stored beside each PDF and
+PNG. Regenerate either version with
+`../../plot_auristream_text_model_neural_alignment.py` and the corresponding
+`--baseline-text-pooling` argument.

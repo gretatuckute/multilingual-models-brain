@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Compare AuriStream-MTP with text models across two neural benchmarks.
 
-Baseline 200 uses the canonical last-token text-model representations and
-noise-ceiling-normalized language-network predictivity. Natural Stories uses
-the 20.48-second text contexts matched to AuriStream's maximum input duration
-and raw held-out-story Pearson correlation.
+Baseline 200 can use either last-token or mean-token text-model
+representations and noise-ceiling-normalized language-network predictivity.
+Natural Stories uses a single standard analysis in which text-model context
+is duration-matched to AuriStream (20.48 seconds), with raw held-out-story
+Pearson correlation.
 """
 
 from __future__ import annotations
@@ -89,7 +90,7 @@ class TextModelSpec:
     baseline_directory: str
     baseline_source: str
     n_states: int
-    naturalstories_run: str
+    naturalstories_matched_run: str
     naturalstories_model_key: str
     color: str
     marker: str
@@ -103,7 +104,9 @@ TEXT_MODELS = (
         baseline_directory="gpt2-xl",
         baseline_source="gpt2-xl",
         n_states=49,
-        naturalstories_run="gpt2_xl_context20p48s_ramptrim100s_alllayers_3shift",
+        naturalstories_matched_run=(
+            "gpt2_xl_context20p48s_ramptrim100s_alllayers_3shift"
+        ),
         naturalstories_model_key="gpt2_xl",
         color="#D49ABB",
         marker="o",
@@ -113,7 +116,7 @@ TEXT_MODELS = (
         baseline_directory="EleutherAI_gpt-j-6b",
         baseline_source="EleutherAI_gpt-j-6b",
         n_states=29,
-        naturalstories_run=(
+        naturalstories_matched_run=(
             "gpt_j_6b_context20p48s_ramptrim100s_alllayers_3shift"
         ),
         naturalstories_model_key="gpt_j_6b",
@@ -125,7 +128,7 @@ TEXT_MODELS = (
         baseline_directory="Qwen_Qwen3-8B",
         baseline_source="Qwen_Qwen3-8B",
         n_states=37,
-        naturalstories_run=(
+        naturalstories_matched_run=(
             "qwen3_8b_context20p48s_ramptrim100s_alllayers_3shift"
         ),
         naturalstories_model_key="qwen3_8b",
@@ -155,8 +158,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
+        "--baseline-text-pooling",
+        choices=("last-tok", "mean-tok"),
+        default="last-tok",
+        help="Text-model sentence pooling used only for Baseline 200.",
+    )
+    parser.add_argument(
         "--stem",
-        default="figure6_exploration_neural_alignment_text_models",
+        default=None,
+        help=(
+            "Output stem. By default the Baseline 200 pooling is written into "
+            "the filename; Natural Stories uses its single standard, "
+            "AuriStream-matched variant."
+        ),
     )
     parser.add_argument("--ncsnr-threshold", type=float, default=0.4)
     parser.add_argument("--workers", type=int, default=min(12, os.cpu_count() or 1))
@@ -168,27 +182,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _baseline_paths(repo: Path, spec: TextModelSpec) -> list[Path]:
+def _baseline_paths(
+    repo: Path,
+    spec: TextModelSpec,
+    text_pooling: str,
+) -> list[Path]:
     root = (
         repo
         / "results_neural"
         / "inv_neural_pred_paral"
         / spec.baseline_directory
     )
-    paths = sorted(root.glob("*_last-tok_zX0_zY1_neural_meta.csv.gz"))
+    paths = sorted(root.glob(f"*_{text_pooling}_zX0_zY1_neural_meta.csv.gz"))
     expected = len(EXPECTED_UIDS) * spec.n_states
     if len(paths) != expected:
         raise RuntimeError(
-            f"Expected {expected} canonical last-token files for {spec.label}; "
+            f"Expected {expected} canonical {text_pooling} files for {spec.label}; "
             f"found {len(paths)} in {root}"
         )
     return paths
 
 
 def _read_text_baseline_file(
-    arguments: tuple[str, str, str, int, float],
+    arguments: tuple[str, str, str, int, float, str],
 ) -> dict[str, object]:
-    label, path_text, expected_source, n_states, ncsnr_threshold = arguments
+    label, path_text, expected_source, n_states, ncsnr_threshold, representation = arguments
     path = Path(path_text)
     source = pd.read_csv(
         path,
@@ -234,7 +252,7 @@ def _read_text_baseline_file(
         "raw_r": float(selected["r_cv"].mean()),
         "normalized_r": float(selected["r_cv_norm"].mean()),
         "n_voxels": int(len(selected)),
-        "representation": "last-tok",
+        "representation": representation,
         "source_path": str(path.resolve()),
     }
 
@@ -243,6 +261,7 @@ def load_text_baseline(
     repo: Path,
     ncsnr_threshold: float,
     workers: int,
+    text_pooling: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     jobs = []
     for spec in TEXT_MODELS:
@@ -253,8 +272,9 @@ def load_text_baseline(
                 spec.baseline_source,
                 spec.n_states,
                 ncsnr_threshold,
+                text_pooling,
             )
-            for path in _baseline_paths(repo, spec)
+            for path in _baseline_paths(repo, spec, text_pooling)
         )
     if workers <= 1:
         rows = [_read_text_baseline_file(job) for job in jobs]
@@ -314,14 +334,14 @@ def load_text_naturalstories(runs_root: Path) -> tuple[pd.DataFrame, list[Path]]
     rows = []
     sources = []
     for spec in TEXT_MODELS:
-        run_dir = runs_root / spec.naturalstories_run
+        run_dir = runs_root / spec.naturalstories_matched_run
         manifest_path = run_dir / "run_manifest.json"
         summary_path = run_dir / "results" / "layer_means.csv"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest.get("model_key") != spec.naturalstories_model_key:
             raise RuntimeError(f"Unexpected model in {manifest_path}")
-        if not np.isclose(manifest.get("context_seconds", np.nan), 20.48):
-            raise RuntimeError(f"Expected context_seconds=20.48 in {manifest_path}")
+        if manifest.get("context_seconds") != 20.48:
+            raise RuntimeError(f"Expected AuriStream-matched 20.48 s context: {manifest_path}")
         if manifest.get("test_trim_start_seconds") != 100:
             raise RuntimeError(f"Expected a 100-second scoring trim: {manifest_path}")
         if not manifest.get("correlation_scored_after_test_trim_only", False):
@@ -438,7 +458,11 @@ def legend_handles() -> list[Line2D]:
     return handles
 
 
-def make_figure(baseline: pd.DataFrame, natural: pd.DataFrame) -> plt.Figure:
+def make_figure(
+    baseline: pd.DataFrame,
+    natural: pd.DataFrame,
+    baseline_text_pooling: str,
+) -> plt.Figure:
     init_rcparams(
         font_family="DejaVu Sans",
         label_size=17,
@@ -461,13 +485,17 @@ def make_figure(baseline: pd.DataFrame, natural: pd.DataFrame) -> plt.Figure:
         (
             axes[0],
             baseline,
-            "Baseline 200",
+            (
+                "Baseline 200 · text last token"
+                if baseline_text_pooling == "last-tok"
+                else "Baseline 200 · text mean token"
+            ),
             "Noise-ceiling-normalized predictivity ($r$)",
         ),
         (
             axes[1],
             natural,
-            "Natural Stories",
+            "Natural Stories · AuriStream-matched",
             "Held-out-story Pearson $r$",
         ),
     )
@@ -507,7 +535,11 @@ def make_figure(baseline: pd.DataFrame, natural: pd.DataFrame) -> plt.Figure:
     fig.text(
         0.5,
         0.014,
-        "Vertical lines show SEM across 8 participants or 9 held-out stories · Natural Stories text context = 20.48 s.",
+        (
+            "Vertical lines show SEM across 8 participants or 9 held-out stories · "
+            f"Baseline 200 text pooling = {baseline_text_pooling.replace('-tok', ' token')} · "
+            "Natural Stories text context = AuriStream-matched 20.48 s."
+        ),
         ha="center",
         va="bottom",
         fontsize=11.2,
@@ -534,8 +566,13 @@ def main() -> None:
     repo = args.auristream_repo.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    text_summary_path = output_dir / f"{args.stem}_baseline200_text_summary.csv"
-    text_participants_path = output_dir / f"{args.stem}_baseline200_text_participants.csv"
+    pooling_slug = args.baseline_text_pooling.replace("-tok", "-token")
+    stem = args.stem or (
+        f"figure6_neural_alignment_baseline200-{pooling_slug}_"
+        "naturalstories-standard"
+    )
+    text_summary_path = output_dir / f"{stem}_baseline200_text_summary.csv"
+    text_participants_path = output_dir / f"{stem}_baseline200_text_participants.csv"
     if (
         args.reuse_text_baseline_tables
         and text_summary_path.exists()
@@ -543,11 +580,17 @@ def main() -> None:
     ):
         text_baseline = pd.read_csv(text_summary_path)
         text_participants = pd.read_csv(text_participants_path)
+        if set(text_participants["representation"]) != {args.baseline_text_pooling}:
+            raise RuntimeError(
+                f"Cached Baseline 200 table does not use {args.baseline_text_pooling}: "
+                f"{text_participants_path}"
+            )
     else:
         text_baseline, text_participants = load_text_baseline(
             repo,
             args.ncsnr_threshold,
             args.workers,
+            args.baseline_text_pooling,
         )
         text_baseline.to_csv(text_summary_path, index=False)
         text_participants.to_csv(text_participants_path, index=False)
@@ -557,7 +600,7 @@ def main() -> None:
         "Baseline 200",
     )
     baseline = pd.concat([auri_baseline, text_baseline], ignore_index=True)
-    baseline_path = output_dir / f"{args.stem}_baseline200_plot_data.csv"
+    baseline_path = output_dir / f"{stem}_baseline200_plot_data.csv"
     baseline.to_csv(baseline_path, index=False)
 
     auri_natural = load_auristream_summary(
@@ -568,7 +611,7 @@ def main() -> None:
         args.naturalstories_runs.expanduser().resolve()
     )
     natural = pd.concat([auri_natural, text_natural], ignore_index=True)
-    natural_path = output_dir / f"{args.stem}_naturalstories_plot_data.csv"
+    natural_path = output_dir / f"{stem}_naturalstories_plot_data.csv"
     natural.to_csv(natural_path, index=False)
 
     combined = pd.concat(
@@ -582,13 +625,13 @@ def main() -> None:
         ],
         ignore_index=True,
     )
-    combined_path = output_dir / f"{args.stem}_plot_data.csv"
+    combined_path = output_dir / f"{stem}_plot_data.csv"
     combined.to_csv(combined_path, index=False)
 
-    fig = make_figure(baseline, natural)
+    fig = make_figure(baseline, natural, args.baseline_text_pooling)
     saved = []
     for extension in ("pdf", "png"):
-        path = output_dir / f"{args.stem}.{extension}"
+        path = output_dir / f"{stem}.{extension}"
         kwargs = {"bbox_inches": "tight"}
         if extension == "png":
             kwargs["dpi"] = 300
@@ -610,7 +653,7 @@ def main() -> None:
                 "n": int(peak["count"]),
             }
         )
-    peak_path = output_dir / f"{args.stem}_descriptive_peaks.csv"
+    peak_path = output_dir / f"{stem}_descriptive_peaks.csv"
     pd.DataFrame(peaks).to_csv(peak_path, index=False)
 
     manifest = {
@@ -623,7 +666,8 @@ def main() -> None:
         "baseline200": {
             "metric": "mean participant-level r_cv_norm across language fROIs",
             "n": 8,
-            "text_representation": "last-tok",
+            "text_representation": args.baseline_text_pooling,
+            "auristream_representation": "mean-tok",
             "ncsnr_threshold": args.ncsnr_threshold,
             "language_frois": list(LANGUAGE_FROIS),
             "auri_source": str(args.auristream_baseline_summary),
@@ -633,6 +677,7 @@ def main() -> None:
         "natural_stories": {
             "metric": "mean held-out-story Pearson r",
             "n": 9,
+            "variant": "standard_auristream_matched",
             "text_context_seconds": 20.48,
             "scoring_trim_seconds": 100,
             "shift": 3,
@@ -644,7 +689,7 @@ def main() -> None:
         "untrained_color": LAYER_UNTRAINED_7B_COLOR,
         "note": "Peak table is descriptive; no peak-selected inferential comparison is implied.",
     }
-    manifest_path = output_dir / f"{args.stem}_manifest.json"
+    manifest_path = output_dir / f"{stem}_manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
