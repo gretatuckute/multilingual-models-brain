@@ -97,6 +97,7 @@ UNTRAINED_LABEL = "7B 40Pred untrained"
 TRAINED_COLOR = model_color(MODEL_KEY)
 UNTRAINED_COLOR = LAYER_UNTRAINED_7B_COLOR
 RELATIVE_DEPTH_TICKS = np.linspace(0.0, 1.0, 6)
+RELATIVE_DEPTH_LIMITS = (-0.015, 1.015)
 
 LINEWIDTH = 1.6
 MARKERSIZE = 7.5
@@ -416,7 +417,7 @@ def make_figure(baseline: pd.DataFrame, natural: pd.DataFrame) -> plt.Figure:
             error_alpha=TRAINED_ERROR_ALPHA,
             zorder=3,
         )
-        axis.set_xlim(0.0, 1.0)
+        axis.set_xlim(*RELATIVE_DEPTH_LIMITS)
         axis.set_xticks(RELATIVE_DEPTH_TICKS)
         axis.set_xlabel("Relative layer depth", fontsize=17)
         axis.set_ylabel(ylabel, fontsize=17)

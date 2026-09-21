@@ -16,3 +16,10 @@ The exact plotted values are in
 `../../plot_auristream_neural_alignment_layers.py`; the script reads the
 Baseline 200 fits from the AuriStream-alpha repository and the completed
 Natural Stories run summaries from this repository.
+
+`figure6_exploration_neural_alignment_text_models.{pdf,png}` adds GPT-2 XL,
+GPT-J 6B, and Qwen3 8B. Baseline 200 uses canonical last-token text
+representations; Natural Stories uses the 20.48-second text context matched to
+AuriStream's maximum input duration. Its plotted values and descriptive peaks
+are stored beside the figure. Regenerate it with
+`../../plot_auristream_text_model_neural_alignment.py`.
