@@ -47,7 +47,15 @@ else:
 if str(AURISTREAM_REPO) not in sys.path:
     sys.path.insert(0, str(AURISTREAM_REPO))
 
-from auristream.plotting import init_rcparams, model_color  # noqa: E402
+from auristream.plotting import (  # noqa: E402
+    LAYER_UNTRAINED_7B_COLOR,
+    LAYER_UNTRAINED_ERROR_ALPHA,
+    LAYER_UNTRAINED_LINE_ALPHA,
+    LAYER_UNTRAINED_MARKER_ALPHA,
+    add_layer_grid,
+    init_rcparams,
+    model_color,
+)
 
 
 MODEL_KEY = "AuriStream7BDeep_40Pred_BigAudioDataset_500k"
@@ -87,21 +95,18 @@ NATURALSTORIES_RUNS = {
 TRAINED_LABEL = "AuriStream-MTP 7B 40Pred"
 UNTRAINED_LABEL = "7B 40Pred untrained"
 TRAINED_COLOR = model_color(MODEL_KEY)
-UNTRAINED_COLOR = "#737373"
+UNTRAINED_COLOR = LAYER_UNTRAINED_7B_COLOR
 RELATIVE_DEPTH_TICKS = np.linspace(0.0, 1.0, 6)
 
 LINEWIDTH = 1.6
 MARKERSIZE = 7.5
 TRAINED_LINE_ALPHA = 0.40
 TRAINED_MARKER_ALPHA = 0.78
-UNTRAINED_LINE_ALPHA = 0.30
-UNTRAINED_MARKER_ALPHA = 0.58
+UNTRAINED_LINE_ALPHA = LAYER_UNTRAINED_LINE_ALPHA
+UNTRAINED_MARKER_ALPHA = LAYER_UNTRAINED_MARKER_ALPHA
 ERROR_LINEWIDTH = 0.82
 TRAINED_ERROR_ALPHA = 0.26
-UNTRAINED_ERROR_ALPHA = 0.20
-GRID_COLOR = "#D9D9D9"
-GRID_LINEWIDTH = 0.55
-GRID_ALPHA = 0.55
+UNTRAINED_ERROR_ALPHA = LAYER_UNTRAINED_ERROR_ALPHA
 
 
 def parse_args() -> argparse.Namespace:
@@ -418,13 +423,7 @@ def make_figure(baseline: pd.DataFrame, natural: pd.DataFrame) -> plt.Figure:
         axis.set_title(title, fontsize=19, weight="bold", pad=10)
         axis.tick_params(direction="out", length=4.0, width=1.0, labelsize=15.5)
         axis.yaxis.set_major_locator(MaxNLocator(nbins=5))
-        axis.set_axisbelow(True)
-        axis.grid(
-            axis="y",
-            color=GRID_COLOR,
-            linewidth=GRID_LINEWIDTH,
-            alpha=GRID_ALPHA,
-        )
+        add_layer_grid(axis, vertical=True)
         _set_y_limits(axis, frame)
         axis.text(
             -0.12,
